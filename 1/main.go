@@ -3,87 +3,97 @@ package main
 import (
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"sort"
 )
 
-func removeFiles(files []fs.FileInfo) (ans []fs.FileInfo) {
-	for _, elem := range files {
-		if elem.IsDir() {
-			ans = append(ans, elem)
+func writePrefix(active []bool, out io.Writer) error {
+	for _, flag := range active {
+		if flag {
+			out.Write([]byte("│"))
 		}
+		out.Write([]byte{'\t'})
 	}
-	return
+	return nil
 }
 
-func writePref(out io.Writer, pref []bool) {
-	for _, elem := range pref {
-		if elem {
-			fmt.Fprint(out, "│\t")
-		} else {
-			fmt.Fprint(out, " \t")
-		}
+func Out(flag bool) []byte {
+	if flag {
+		return []byte("├───")
 	}
+	return []byte("└───")
 }
 
-func writeBranch(out io.Writer, last bool) {
-	start := "├"
-	if last {
-		start = "└"
+func printSize(flag bool, entry os.DirEntry) []byte {
+	if !flag || entry.IsDir() {
+		return []byte{}
 	}
-	fmt.Fprint(out, start+"───")
+	fileInfo, _ := entry.Info()
+	sz := fileInfo.Size()
+
+	add := fmt.Sprint(sz) + "b"
+	if sz == 0 {
+		add = "empty"
+	}
+
+	return []byte(" (" + add + ")")
 }
 
-func dfsDirTree(out io.Writer, path string, printFiles bool, prefix []bool) error {
-	f, err := os.Open(path)
+func dfsDirTree(active []bool, out io.Writer, path string, printFiles bool) error {
+	list, err := os.ReadDir(path)
 	if err != nil {
 		return err
 	}
 
-	files, err := f.Readdir(0)
-	if err != nil {
-		return err
+	var newList []os.DirEntry
+	for _, entry := range list {
+		if entry.IsDir() {
+			newList = append(newList, entry)
+		}
 	}
 
 	if !printFiles {
-		files = removeFiles(files)
+		list = newList
 	}
 
-	sort.Slice(files, func(i, j int) bool {
-		return files[i].Name() < files[j].Name()
+	if len(list) == 0 {
+		return nil
+	}
+
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].Name() < list[j].Name()
 	})
 
-	for i, elem := range files {
-		last := i == len(files)-1
-		writePref(out, prefix)
-		writeBranch(out, last)
-		fmt.Fprint(out, elem.Name())
-		next := "\n"
-		if last && len(prefix) == 0 {
-			next = ""
+	flag := true
+
+	for idx, entry := range list {
+
+		writePrefix(active, out)
+
+		if idx == len(list)-1 {
+			flag = false
 		}
-		if elem.IsDir() {
-			fmt.Fprint(out, "\n")
-			suf := true
-			if last {
-				suf = false
-			}
-			dfsDirTree(out, path+string(os.PathSeparator)+elem.Name(), printFiles, append(prefix, suf))
-		} else {
-			if elem.Size() != 0 {
-				fmt.Fprintf(out, " (%db)"+next, elem.Size())
-			} else {
-				fmt.Fprintf(out, " (empty)"+next)
+
+		out.Write(Out(flag))
+
+		out.Write([]byte(entry.Name()))
+
+		out.Write(printSize(printFiles, entry))
+
+		out.Write([]byte("\n"))
+
+		if entry.IsDir() {
+			err = dfsDirTree(append(active, flag), out, path+string(os.PathSeparator)+entry.Name(), printFiles)
+			if err != nil {
+				return err
 			}
 		}
 	}
-
 	return nil
 }
 
 func dirTree(out io.Writer, path string, printFiles bool) error {
-	return dfsDirTree(out, path, printFiles, make([]bool, 0))
+	return dfsDirTree([]bool{}, out, path, printFiles)
 }
 
 func main() {
