@@ -3,116 +3,116 @@ package main
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 )
 
-var (
-	ths = [...]string{"0", "1", "2", "3", "4", "5"}
-)
-
-func ExecutePipeline(tasks ...job) {
-
-	chans := make([]chan interface{}, len(tasks)+1)
-
+func ExecutePipeline(jobs ...job) {
 	wg := &sync.WaitGroup{}
-	wg.Add(len(tasks))
 
-	for i := range chans {
-		chans[i] = make(chan interface{})
+	chanList := make([]chan interface{}, len(jobs)+1)
+	for i := range chanList {
+		chanList[i] = make(chan interface{})
 	}
 
-	for i := range tasks {
-		go func(itr int) {
+	for idx, curJob := range jobs {
+		wg.Add(1)
+		go func(idx int, curJob job) {
+			defer close(chanList[idx+1])
 			defer wg.Done()
-			tasks[itr](chans[itr], chans[itr+1])
-			close(chans[itr+1])
-		}(i)
+			curJob(chanList[idx], chanList[idx+1])
+		}(idx, curJob)
 	}
 
+	close(chanList[0])
 	wg.Wait()
-
 }
 
 func SingleHash(in, out chan interface{}) {
-	waits := &sync.WaitGroup{}
-	mu := &sync.Mutex{}
-	for elem := range in {
-		waits.Add(1)
-		go func(curElem interface{}) {
-			defer waits.Done()
-			str := fmt.Sprint(curElem)
+	wgGlobal := &sync.WaitGroup{}
+	mx := &sync.Mutex{}
+	for data := range in {
+		wgGlobal.Add(1)
+		go func(data interface{}) {
+
+			defer wgGlobal.Done()
+
 			wg := &sync.WaitGroup{}
-			wg.Add(1)
-			var temp, temp2 string
+			wg.Add(2)
+
+			str := fmt.Sprint(data)
+			left, right := "", ""
+
 			go func() {
 				defer wg.Done()
-				temp = DataSignerCrc32(str) + "~"
+				left = DataSignerCrc32(str)
 			}()
-			mu.Lock()
-			temp2 = DataSignerMd5(str)
-			mu.Unlock()
-			temp2 = DataSignerCrc32(temp2)
+
+			go func() {
+				defer wg.Done()
+				mx.Lock()
+				md := DataSignerMd5(str)
+				mx.Unlock()
+				right = DataSignerCrc32(md)
+			}()
+
 			wg.Wait()
-			out <- temp + temp2
-		}(elem)
+
+			res := left + "~" + right
+			out <- res
+		}(data)
 	}
-	waits.Wait()
+	wgGlobal.Wait()
 }
 
 func MultiHash(in, out chan interface{}) {
-
-	waits := &sync.WaitGroup{}
-
-	for elem := range in {
-		waits.Add(1)
-		go func(curElem interface{}) {
-			defer waits.Done()
-			ans := ""
-			str := fmt.Sprint(curElem)
-			crcSlice := make([]string, 6)
-
+	wgGlobal := &sync.WaitGroup{}
+	for data := range in {
+		wgGlobal.Add(1)
+		go func(data interface{}) {
+			defer wgGlobal.Done()
+			str := fmt.Sprint(data)
+			builder := strings.Builder{}
+			tempList := make([]string, 6)
 			wg := &sync.WaitGroup{}
-			wg.Add(6)
 
-			for i := range ths {
-				go func(num int) {
+			for i := 0; i < 6; i++ {
+				wg.Add(1)
+				go func(i int) {
 					defer wg.Done()
-					crcSlice[num] = DataSignerCrc32(ths[num] + str)
+					tempList[i] = DataSignerCrc32(fmt.Sprint(i) + str)
 				}(i)
 			}
 
 			wg.Wait()
-
-			for _, part := range crcSlice {
-				ans += part
+			for i := 0; i < 6; i++ {
+				builder.WriteString(tempList[i])
 			}
 
-			out <- ans
-		}(elem)
+			res := builder.String()
+			out <- res
+		}(data)
 	}
-
-	waits.Wait()
-
+	wgGlobal.Wait()
 }
 
 func CombineResults(in, out chan interface{}) {
-	strs := make([]string, 0)
-	for elem := range in {
-		strs = append(strs, fmt.Sprint(elem))
+	resList := make([]string, 0)
+	for data := range in {
+		str := fmt.Sprint(data)
+		resList = append(resList, str)
 	}
 
-	sort.Slice(strs, func(i, j int) bool {
-		return strs[i] < strs[j]
+	sort.Slice(resList, func(i, j int) bool {
+		return resList[i] < resList[j]
 	})
 
-	ans := ""
-	for i, elem := range strs {
-		ans += elem
-		if i != len(strs)-1 {
-			ans += "_"
-		}
+	res := strings.Builder{}
+	res.WriteString(resList[0])
+	for i := 1; i < len(resList); i++ {
+		res.WriteString("_" + resList[i])
 	}
 
-	out <- ans
+	out <- res.String()
 
 }
