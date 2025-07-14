@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"encoding/xml"
-	"io"
+	"fmt"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,247 +13,396 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
-type UserDTO struct {
-	Row []struct {
-		Id        int    `xml:"id"`
-		FirstName string `xml:"first_name"`
-		LastName  string `xml:"last_name"`
-		Age       int    `xml:"age"`
-		Gender    string `xml:"gender"`
-		About     string `xml:"about"`
-	} `xml:"row"`
-}
-
-func validate(r *http.Request) *SearchRequest {
-
-	limit, err := strconv.Atoi(r.FormValue("limit"))
-	if err != nil {
-		return nil
-	}
-
-	offset, err := strconv.Atoi(r.FormValue("offset"))
-	if err != nil {
-		return nil
-	}
-
-	order, err := strconv.Atoi(r.FormValue("order_by"))
-	if err != nil {
-		return nil
-	}
-
-	req := SearchRequest{
-		Limit:      limit,
-		Offset:     offset,
-		OrderBy:    order,
-		OrderField: r.FormValue("order_field"),
-		Query:      r.FormValue("query"),
-	}
-
-	if req.OrderField == "" {
-		req.OrderField = "Name"
-	}
-
-	orderBy := req.OrderBy < 2 && req.OrderBy > -2
-	orderField := req.OrderField == "Name" || req.OrderField == "Id" || req.OrderField == "Age"
-	if orderBy && orderField {
-		return &req
-	}
-	return nil
-
-}
-
-func less(i, j int, field string, users []User) bool {
-	switch field {
-	case "Name":
-		return users[i].Name < users[j].Name
-	case "Id":
-		return users[i].Id < users[j].Id
+func less(a, b Person, orderField string) bool {
+	switch orderField {
 	case "Age":
-		return users[i].Age < users[j].Age
+		return a.Age < b.Age
+	case "Name":
+		return a.FirstName+" "+a.LastName < b.FirstName+" "+b.LastName
+	case "Id":
+		return a.ID < b.ID
 	}
 	return false
 }
 
-func SearchServer(w http.ResponseWriter, r *http.Request) {
-
-	token := r.Header.Get("AccessToken")
-	if token != "Test" {
-		w.WriteHeader(http.StatusUnauthorized)
+func sortResult(orderBy int, orderField string, list []Person) {
+	if orderBy == 0 {
 		return
 	}
+	sort.Slice(list, func(i, j int) bool {
+		if orderBy == 1 {
+			i, j = j, i
+		}
+		return less(list[i], list[j], orderField)
+	})
+}
 
-	req := validate(r)
-	if req == nil {
-		w.WriteHeader(http.StatusBadRequest)
+func convertToUser(list []Person) []User {
+	ans := make([]User, len(list))
+	for i, person := range list {
+		ans[i] = User{
+			Id:     person.ID,
+			Name:   person.FirstName + " " + person.LastName,
+			Age:    person.Age,
+			About:  person.About,
+			Gender: person.Gender,
+		}
+	}
+	return ans
+}
+
+func FreakServer(w http.ResponseWriter, req *http.Request) {
+	trash := Person{
+		ID:        0,
+		GUID:      "",
+		IsActive:  false,
+		Balance:   "",
+		Picture:   "",
+		Age:       0,
+		EyeColor:  "",
+		FirstName: "",
+		LastName:  "",
+	}
+	ans, err := json.Marshal(&trash)
+	if err != nil {
+		panic(err)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(ans)
+}
+
+func MissServer(w http.ResponseWriter, req *http.Request) {
+	http.Error(w, "Not found", http.StatusBadRequest)
+}
+
+func BadRequestServer(w http.ResponseWriter, req *http.Request) {
+	res := SearchErrorResponse{
+		Error: "unknown error",
+	}
+	ans, _ := json.Marshal(res)
+	http.Error(w, string(ans), http.StatusBadRequest)
+	return
+}
+
+func SearchServer(w http.ResponseWriter, req *http.Request) {
+	query := req.FormValue("query")
+	orderField := req.FormValue("order_field")
+	orderBy := req.FormValue("order_by")
+	limit := req.FormValue("limit")
+	offset := req.FormValue("offset")
+
+	token := req.Header.Get("AccessToken")
+	if token != "token" {
+		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 		return
 	}
 
 	file, err := os.Open("dataset.xml")
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	records, err := io.ReadAll(file)
+	users := &UserList{}
+	err = xml.NewDecoder(file).Decode(users)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 
-	var users UserDTO
-	err = xml.Unmarshal(records, &users)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
+	resultList := make([]Person, 0)
+	for _, user := range users.Users {
+		name := user.FirstName + " " + user.LastName
+		about := user.About
 
-	var ans []User
-	for _, elem := range users.Row {
-		name := elem.FirstName + " " + elem.LastName
-		ans = append(ans, User{
-			Name:   name,
-			Id:     elem.Id,
-			Age:    elem.Age,
-			Gender: elem.Gender,
-			About:  elem.About,
-		})
-	}
-
-	pos := 0
-	for i := 0; i < len(ans); i++ {
-		if strings.Contains(ans[i].Name, req.Query) || strings.Contains(ans[i].About, req.Query) {
-			ans[pos] = ans[i]
-			pos++
+		if name == query || strings.Contains(about, query) {
+			resultList = append(resultList, user)
 		}
 	}
 
-	ans = ans[:pos]
+	if orderField == "" {
+		orderField = "Name"
+	}
 
-	if req.OrderBy != 0 {
-		sort.Slice(ans, func(i, j int) bool {
-			if req.OrderBy == -1 {
-				i, j = j, i
+	if orderField != "Age" && orderField != "Name" && orderField != "Id" {
+		res := SearchErrorResponse{
+			Error: "ErrorBadOrderField",
+		}
+		ans, _ := json.Marshal(res)
+		http.Error(w, string(ans), http.StatusBadRequest)
+		return
+	}
+
+	order, err := strconv.Atoi(orderBy)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid order_by: %s", orderBy), http.StatusBadRequest)
+		return
+	}
+
+	sortResult(order, orderField, resultList)
+
+	limitInt, err := strconv.Atoi(limit)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid limit: %s", limit), http.StatusBadRequest)
+		return
+	}
+	offsetInt, err := strconv.Atoi(offset)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid offset: %s", offset), http.StatusBadRequest)
+		return
+	}
+
+	finalList := make([]Person, 0)
+	for i := offsetInt; i < offsetInt+limitInt; i++ {
+		if i >= len(resultList) {
+			break
+		}
+		finalList = append(finalList, resultList[i])
+	}
+
+	ansList := convertToUser(finalList)
+
+	ans, err := json.Marshal(ansList)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(ans)
+
+}
+
+func InternalErrorServer(w http.ResponseWriter, req *http.Request) {
+	http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+}
+
+func TestClientCorrect(t *testing.T) {
+	t.Parallel()
+
+	tableTests := []struct {
+		request  SearchRequest
+		expected SearchResponse
+	}{
+		{
+			request: SearchRequest{
+				Limit:      30,
+				Offset:     0,
+				Query:      "Boyd Wolf",
+				OrderField: "",
+				OrderBy:    OrderByDesc,
+			},
+			expected: SearchResponse{
+				Users: []User{
+					{
+						Id:     0,
+						Name:   "Boyd Wolf",
+						Age:    22,
+						About:  "Nulla cillum enim voluptate consequat laborum esse excepteur occaecat commodo nostrud excepteur ut cupidatat. Occaecat minim incididunt ut proident ad sint nostrud ad laborum sint pariatur. Ut nulla commodo dolore officia. Consequat anim eiusmod amet commodo eiusmod deserunt culpa. Ea sit dolore nostrud cillum proident nisi mollit est Lorem pariatur. Lorem aute officia deserunt dolor nisi aliqua consequat nulla nostrud ipsum irure id deserunt dolore. Minim reprehenderit nulla exercitation labore ipsum.\n",
+						Gender: "male",
+					},
+				},
+				NextPage: false,
+			},
+		},
+		{
+			request: SearchRequest{
+				Limit:      1,
+				Offset:     0,
+				Query:      "enim",
+				OrderField: "Id",
+				OrderBy:    OrderByAsc,
+			},
+			expected: SearchResponse{
+				Users: []User{
+					{
+						Id:     0,
+						Name:   "Boyd Wolf",
+						Age:    22,
+						About:  "Nulla cillum enim voluptate consequat laborum esse excepteur occaecat commodo nostrud excepteur ut cupidatat. Occaecat minim incididunt ut proident ad sint nostrud ad laborum sint pariatur. Ut nulla commodo dolore officia. Consequat anim eiusmod amet commodo eiusmod deserunt culpa. Ea sit dolore nostrud cillum proident nisi mollit est Lorem pariatur. Lorem aute officia deserunt dolor nisi aliqua consequat nulla nostrud ipsum irure id deserunt dolore. Minim reprehenderit nulla exercitation labore ipsum.\n",
+						Gender: "male",
+					},
+				},
+				NextPage: true,
+			},
+		},
+	}
+
+	for i, tt := range tableTests {
+		tt := tt
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			t.Parallel()
+
+			ts := httptest.NewServer(http.HandlerFunc(SearchServer))
+			defer ts.Close()
+
+			client := SearchClient{
+				AccessToken: "token",
+				URL:         ts.URL,
 			}
-			return less(i, j, req.OrderField, ans)
+
+			res, err := client.FindUsers(tt.request)
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected.Users, res.Users)
+			assert.Equal(t, tt.expected.NextPage, res.NextPage)
 		})
 	}
 
-	if req.Offset >= len(ans) || req.Limit == 0 {
-		w.Write([]byte("{}"))
-		return
+}
+
+func TimeoutServer(w http.ResponseWriter, req *http.Request) {
+	time.Sleep(2 * time.Second)
+}
+
+func TestClientError(t *testing.T) {
+	t.Parallel()
+
+	tableTests := []struct {
+		handler http.HandlerFunc
+		request SearchRequest
+		token   string
+	}{
+		{
+			token:   "token",
+			handler: InternalErrorServer,
+			request: SearchRequest{
+				Limit:      1,
+				Offset:     0,
+				Query:      "Boyd Wolf",
+				OrderField: "",
+				OrderBy:    OrderByAsc,
+			},
+		},
+		{
+			token:   "token",
+			handler: SearchServer,
+			request: SearchRequest{
+				Limit:      -1,
+				Offset:     0,
+				Query:      "",
+				OrderField: "",
+				OrderBy:    OrderByAsIs,
+			},
+		},
+		{
+			token:   "token",
+			handler: SearchServer,
+			request: SearchRequest{
+				Limit:      0,
+				Offset:     -1,
+				Query:      "",
+				OrderField: "",
+				OrderBy:    OrderByAsIs,
+			},
+		},
+		{
+			token:   "bad token",
+			handler: SearchServer,
+			request: SearchRequest{
+				Limit:      1,
+				Offset:     0,
+				Query:      "",
+				OrderField: "",
+				OrderBy:    OrderByAsIs,
+			},
+		},
+		{
+			token:   "token",
+			handler: SearchServer,
+			request: SearchRequest{
+				Limit:      1,
+				Offset:     0,
+				Query:      "",
+				OrderField: ErrorBadOrderField,
+				OrderBy:    0,
+			},
+		},
+		{
+			token:   "token",
+			handler: TimeoutServer,
+			request: SearchRequest{
+				Limit:      1,
+				Offset:     0,
+				Query:      "",
+				OrderField: "",
+				OrderBy:    OrderByAsIs,
+			},
+		},
+		{
+			token:   "token",
+			handler: FreakServer,
+			request: SearchRequest{
+				Limit:      1,
+				Offset:     0,
+				Query:      "",
+				OrderField: "",
+				OrderBy:    OrderByAsIs,
+			},
+		},
+		{
+			token:   "token",
+			handler: MissServer,
+			request: SearchRequest{
+				Limit:      1,
+				Offset:     0,
+				Query:      "",
+				OrderField: "",
+				OrderBy:    OrderByAsIs,
+			},
+		},
+		{
+			token:   "token",
+			handler: BadRequestServer,
+			request: SearchRequest{
+				Limit:      1,
+				Offset:     0,
+				Query:      "",
+				OrderField: "",
+				OrderBy:    OrderByAsIs,
+			},
+		},
 	}
 
-	var end int
-	if req.Offset+req.Limit > len(ans) {
-		end = len(ans)
-	} else {
-		end = req.Offset + req.Limit
-	}
+	for i, tt := range tableTests {
+		tt := tt
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			t.Parallel()
 
-	if req.Offset >= len(ans) || req.Limit == 0 {
-		ans = []User{}
-	} else {
-		ans = ans[req.Offset:end]
-	}
+			ts := httptest.NewServer(tt.handler)
+			defer ts.Close()
 
-	out, err := json.Marshal(ans)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
+			client := SearchClient{
+				AccessToken: tt.token,
+				URL:         ts.URL,
+			}
+			res, err := client.FindUsers(tt.request)
 
-	w.Write(out)
+			assert.Nil(t, res)
+			assert.Error(t, err)
+		})
+	}
 
 }
 
-type TestCase struct {
-	request SearchRequest
-	e       bool
-}
-
-func TestFindUsersOk(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(SearchServer))
-	defer ts.Close()
+func TestErrorClient(t *testing.T) {
+	t.Parallel()
 
 	client := SearchClient{
-		AccessToken: "Test",
-		URL:         ts.URL,
+		AccessToken: "token",
+		URL:         "http://127.0.0.1:1234",
 	}
 
-	tc := []TestCase{
-		{
-			request: SearchRequest{
-				Limit:      5,
-				Offset:     0,
-				Query:      "Nulla",
-				OrderField: "Name",
-				OrderBy:    1,
-			},
-			e: false,
-		},
-		{
-			request: SearchRequest{
-				Limit:      30,
-				Offset:     0,
-				Query:      "Nulla",
-				OrderField: "Name",
-				OrderBy:    1,
-			},
-			e: false,
-		},
+	requst := SearchRequest{
+		Limit:      1,
+		Offset:     0,
+		Query:      "",
+		OrderField: "",
+		OrderBy:    OrderByAsIs,
 	}
 
-	for _, req := range tc {
-		_, err := client.FindUsers(req.request)
-		if err != nil && !req.e {
-			t.Errorf("Expected no error, but found error")
-		}
-		if err == nil && req.e {
-			t.Errorf("Expected error, but no error found")
-		}
-	}
+	res, err := client.FindUsers(requst)
 
-}
-
-func TestFindUserError(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(SearchServer))
-	defer ts.Close()
-
-	client := SearchClient{
-		AccessToken: "Test",
-		URL:         ts.URL,
-	}
-
-	tc := []TestCase{
-		{
-			request: SearchRequest{
-				Limit:      -25,
-				Offset:     0,
-				Query:      "Nulla",
-				OrderField: "Name",
-				OrderBy:    1,
-			},
-			e: true,
-		},
-		{
-			request: SearchRequest{
-				Limit:      30,
-				Offset:     -25,
-				Query:      "Nulla",
-				OrderField: "Name",
-				OrderBy:    1,
-			},
-			e: true,
-		},
-	}
-
-	for _, elem := range tc {
-		_, err := client.FindUsers(elem.request)
-		if err == nil {
-			t.Errorf("Expected error, no error found")
-		}
-	}
-
+	assert.Nil(t, res)
+	assert.Error(t, err)
 }
